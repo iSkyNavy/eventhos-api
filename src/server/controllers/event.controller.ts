@@ -1,7 +1,7 @@
 import { NextFunction, Request, Response } from 'express';
 import { Knex } from 'knex';
 import axios, { AxiosError, AxiosRequestConfig, AxiosResponse } from 'axios';
-import { async, concat, defer, merge, Observable, take } from 'rxjs';
+import { concat, defer, merge, Observable, take } from 'rxjs';
 import {
   Action,
   ActionSecurity,
@@ -119,9 +119,113 @@ class EventControllers {
    *
    * @describe Validates the recived event
    */
+  excEventContractsWithError = async (
+    req: Request,
+    res: Response,
+    next: NextFunction,
+  ) => {
+    try {
+      const contractDetails = await this.knexPool
+        .table('contract_exc_detail')
+        .where('attempts', 0)
+        .where('state', 'error');
+      if (contractDetails.length == 0) {
+        return res
+          .status(200)
+          .json({ code: 20000, message: 'success but there are not errors' });
+      }
+      for await (const contractDetail of contractDetails) {
+        const eventContract = await this.knexPool
+          .from('contract')
+          .select()
+          .join('event', 'contract.event_id', 'event.id')
+          .join('action', 'contract.action_id', 'action.id')
+          .join('action_security', 'action.id', 'action_security.action_id')
+          .options({ nestTables: true })
+          .where('contract.id', contractDetail.contract_id)
+          .where('contract.active', true)
+          .andWhere('contract.deleted', false)
+          .first();
+        const receivedEventExist = await this.knexPool
+          .from('received_event')
+          .where('id', contractDetail.received_event_id)
+          .first();
+        const receivedEventExistRequest = JSON.parse(
+          await this.decryptString(receivedEventExist.received_request),
+        );
+        const basicRequest = {
+          headers: receivedEventExistRequest.headers,
+          query: receivedEventExistRequest.query,
+          body: receivedEventExistRequest.body,
+          method: receivedEventExistRequest.method,
+          url: req.protocol + '://' + req.get('host') + req.originalUrl,
+        };
+
+        const baseRequestEncryption = await this.encryptString(
+          JSON.stringify(basicRequest),
+        );
+        const contractExcDetailExist = await this.knexPool
+          .table('contract_exc_detail')
+          .increment('attempts', 1)
+          .where('id', contractDetail.id)
+          .where('attempts', 0)
+          .where('state', 'error');
+
+        const contractExcTryExist = await this.knexPool
+          .table('contract_exc_try')
+          .increment('attempts', 1)
+          .where('contract_exc_detail_id', contractDetail.id)
+          .where('attempts', 0)
+          .where('state', 'error');
+
+        if (!contractExcDetailExist || !contractExcTryExist) {
+          return this.returnError(
+            'Error when you try execute all errors',
+            'Error when you try execute all errors',
+            400206,
+            400,
+            'excEventContractsWithError',
+            next,
+          );
+        }
+        const receivedEvent = await this.knexPool
+          .table('received_event')
+          .insert({
+            event_id: eventContract.contract.event_id,
+            received_request:
+              baseRequestEncryption.hexedInitVector +
+              '|.|' +
+              baseRequestEncryption.encryptedData,
+          });
+
+        const parsedReq = {
+          headers: receivedEventExistRequest.headers,
+          query: receivedEventExistRequest.query,
+          body: receivedEventExistRequest.body,
+          oauthResponse: {} as {
+            headers: Record<string, string>;
+            body: Record<string, any>;
+          },
+        };
+        this.executeContract(eventContract, receivedEvent, parsedReq);
+      }
+      return res.status(200).json({ code: 20000, message: 'success' });
+    } catch (error) {
+      return this.returnError(
+        error.message,
+        error.message,
+        500201,
+        500,
+        'excEventContractsWithError',
+        next,
+        error,
+      );
+    }
+  };
   eventValidation = async (req: Request, res: Response, next: NextFunction) => {
     try {
-      const systemKey = (req.query['access-key'] || req.headers['access-key'])  as string;
+      const systemKey = (req.query['access-key'] ||
+        req.headers['access-key']) as string;
       const eventIdentifier = req.query['event-identifier'] as string;
 
       if (!systemKey || !eventIdentifier) {
@@ -230,7 +334,7 @@ class EventControllers {
         error.message,
         500201,
         500,
-        'eventValidation',
+        'excEvents',
         next,
         error,
       );
@@ -977,7 +1081,6 @@ class EventControllers {
       getConfig().log().error(error);
     }
   };
-
   async encryptString(stringToEncrypt: string) {
     const algorithm = 'aes-256-ctr';
     const initVector = crypto.randomBytes(16);

@@ -43,6 +43,12 @@ export const createRouteEvent = (
     controllers.manageEventContract,
   );
 
+  authRouter.obPost(
+    `/execute-all-errors`,
+    'event:update',
+    controllers.excEventContractsWithError,
+  );
+
   authRouter.obPost('/', 'event:create', controllers.createEvent);
 
   authRouter.obGet('/received', 'event:select', controllers.listReceivedEvents);
